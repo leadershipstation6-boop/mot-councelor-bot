@@ -41,21 +41,13 @@ type KakaoRequest = {
   };
 };
 
-const sessions = new Map<string, any>();
-
 export async function POST(req: NextRequest) {
   try {
     const body: KakaoRequest = await req.json();
-    const userId = body.userRequest.user.id;
     const userInput = body.userRequest.utterance.trim();
 
-    let session = sessions.get(userId) || {
-      scenarioId: null,
-      turnIndex: 0,
-      history: [],
-    };
-
-    if (userInput === '시작' || !session.scenarioId) {
+    // 1. 시작 명령어
+    if (userInput === '시작') {
       return NextResponse.json({
         version: '2.0',
         template: {
@@ -82,15 +74,9 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    // 2. 시나리오 선택 (S1 또는 S2)
     if (userInput === 'S1' || userInput === 'S2') {
       const scenario = scenarios[userInput];
-      session = {
-        scenarioId: userInput,
-        turnIndex: 0,
-        history: [],
-      };
-      sessions.set(userId, session);
-
       const firstTurn = scenario.turns[0];
 
       return NextResponse.json({
@@ -99,7 +85,7 @@ export async function POST(req: NextRequest) {
           outputs: [
             {
               simpleText: {
-                text: `📋 ${scenario.title}\n\n🏥 상황: ${scenario.context}\n\n👨 환자: "${firstTurn.text}"\n\n💭 감정: ${firstTurn.emotion}\n\n━━━━━━━━━━━━━━━━━━\n👨‍⚕️ 어떻게 응대하시겠습니까?`,
+                text: `📋 ${scenario.title}\n\n🏥 상황: ${scenario.context}\n\n━━━━━━━━━━━━━━━━━━\n\n👨 환자: "${firstTurn.text}"\n\n💭 감정: ${firstTurn.emotion}\n\n━━━━━━━━━━━━━━━━━━\n\n👨‍⚕️ 상담사님은 어떻게 응대하시겠습니까?\n\n💬 답변을 입력해주세요!`,
               },
             },
           ],
@@ -107,19 +93,10 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const scenario = scenarios[session.scenarioId];
-    if (!scenario) {
-      return NextResponse.json({
-        version: '2.0',
-        template: {
-          outputs: [
-            { simpleText: { text: '시나리오를 먼저 선택해주세요. "시작"을 입력하세요.' } },
-          ],
-        },
-      });
-    }
-
-    const currentTurn = scenario.turns[session.turnIndex];
+    // 3. 사용자 답변 분석 (그 외 모든 입력)
+    // 가장 최근 시나리오는 S1으로 가정 (MVP)
+    const scenario = scenarios['S1'];
+    const currentTurn = scenario.turns[0];
 
     const analysisPrompt = `
 상황: ${scenario.context}
@@ -163,7 +140,7 @@ export async function POST(req: NextRequest) {
       };
     }
 
-    let feedbackText = `━━━━━━━━━━━━━━━━━━\n📊 점수: ${analysis.score}점 (${analysis.grade} 등급)\n\n`;
+    let feedbackText = `━━━━━━━━━━━━━━━━━━\n📊 분석 결과\n━━━━━━━━━━━━━━━━━━\n\n점수: ${analysis.score}점 (${analysis.grade} 등급)\n\n`;
     
     if (analysis.feedback.good && analysis.feedback.good.length > 0) {
       feedbackText += '✅ 잘한 점:\n' + analysis.feedback.good.map((g: string) => `• ${g}`).join('\n') + '\n\n';
@@ -178,34 +155,28 @@ export async function POST(req: NextRequest) {
     }
     
     if (analysis.next_tip) {
-      feedbackText += `🎯 다음 팁:\n${analysis.next_tip}\n`;
+      feedbackText += `🎯 다음 팁:\n${analysis.next_tip}\n\n`;
     }
 
-    session.turnIndex++;
-    sessions.set(userId, session);
-
-    if (session.turnIndex >= scenario.turns.length) {
-      feedbackText += '\n\n✅ 시나리오 완료!\n"시작"을 입력하면 새로운 시나리오를 연습할 수 있습니다.';
-      sessions.delete(userId);
-
-      return NextResponse.json({
-        version: '2.0',
-        template: {
-          outputs: [{ simpleText: { text: feedbackText } }],
-          quickReplies: [
-            { label: '🔄 다시 시작', action: 'message', messageText: '시작' },
-          ],
-        },
-      });
-    }
-
-    const nextTurn = scenario.turns[session.turnIndex];
-    feedbackText += `\n\n━━━━━━━━━━━━━━━━━━\n👨 환자: "${nextTurn.text}"\n💭 감정: ${nextTurn.emotion}\n\n👨‍⚕️ 어떻게 응대하시겠습니까?`;
+    feedbackText += `━━━━━━━━━━━━━━━━━━\n\n다른 시나리오를 연습하려면\n"시작"을 입력하세요!`;
 
     return NextResponse.json({
       version: '2.0',
       template: {
-        outputs: [{ simpleText: { text: feedbackText } }],
+        outputs: [
+          {
+            simpleText: {
+              text: feedbackText,
+            },
+          },
+        ],
+        quickReplies: [
+          {
+            label: '🔄 처음으로',
+            action: 'message',
+            messageText: '시작',
+          },
+        ],
       },
     });
 
@@ -217,8 +188,15 @@ export async function POST(req: NextRequest) {
         outputs: [
           {
             simpleText: {
-              text: '오류가 발생했습니다. "시작"을 입력해서 다시 시도해주세요.',
+              text: '오류가 발생했습니다.\n\n"시작"을 입력해서 다시 시도해주세요.',
             },
+          },
+        ],
+        quickReplies: [
+          {
+            label: '🔄 처음으로',
+            action: 'message',
+            messageText: '시작',
           },
         ],
       },
