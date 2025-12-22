@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import Anthropic from '@anthropic-ai/sdk';
 import { scenarios } from '../../../../core/scenarios';
+import { kv } from '@vercel/kv';
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY || '',
@@ -41,13 +42,30 @@ type KakaoRequest = {
   };
 };
 
+type Session = {
+  scenarioId: string | null;
+  turnIndex: number;
+};
+
 export async function POST(req: NextRequest) {
   try {
     const body: KakaoRequest = await req.json();
+    const userId = body.userRequest.user.id;
     const userInput = body.userRequest.utterance.trim();
+
+    // 세션 가져오기
+    const sessionKey = `session:${userId}`;
+    let session: Session = await kv.get(sessionKey) || {
+      scenarioId: null,
+      turnIndex: 0,
+    };
 
     // 1. 시작 명령어
     if (userInput === '시작') {
+      // 세션 초기화
+      session = { scenarioId: null, turnIndex: 0 };
+      await kv.set(sessionKey, session, { ex: 3600 }); // 1시간 유효
+
       return NextResponse.json({
         version: '2.0',
         template: {
@@ -74,9 +92,17 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // 2. 시나리오 선택 (S1 또는 S2)
+    // 2. 시나리오 선택
     if (userInput === 'S1' || userInput === 'S2') {
       const scenario = scenarios[userInput];
+      
+      // 세션 업데이트
+      session = {
+        scenarioId: userInput,
+        turnIndex: 0,
+      };
+      await kv.set(sessionKey, session, { ex: 3600 });
+
       const firstTurn = scenario.turns[0];
 
       return NextResponse.json({
@@ -93,11 +119,33 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // 3. 사용자 답변 분석 (그 외 모든 입력)
-    // 가장 최근 시나리오는 S1으로 가정 (MVP)
-    const scenario = scenarios['S1'];
-    const currentTurn = scenario.turns[0];
+    // 3. 사용자 답변 분석
+    if (!session.scenarioId) {
+      return NextResponse.json({
+        version: '2.0',
+        template: {
+          outputs: [
+            {
+              simpleText: {
+                text: '시나리오를 먼저 선택해주세요.\n\n"시작"을 입력하세요!',
+              },
+            },
+          ],
+          quickReplies: [
+            {
+              label: '🔄 시작하기',
+              action: 'message',
+              messageText: '시작',
+            },
+          ],
+        },
+      });
+    }
 
+    const scenario = scenarios[session.scenarioId];
+    const currentTurn = scenario.turns[session.turnIndex];
+
+    // Claude 분석
     const analysisPrompt = `
 상황: ${scenario.context}
 환자 말: "${currentTurn.text}"
@@ -155,28 +203,40 @@ export async function POST(req: NextRequest) {
     }
     
     if (analysis.next_tip) {
-      feedbackText += `🎯 다음 팁:\n${analysis.next_tip}\n\n`;
+      feedbackText += `🎯 다음 팁:\n${analysis.next_tip}\n`;
     }
 
-    feedbackText += `━━━━━━━━━━━━━━━━━━\n\n다른 시나리오를 연습하려면\n"시작"을 입력하세요!`;
+    // 다음 턴으로 이동
+    session.turnIndex++;
+    await kv.set(sessionKey, session, { ex: 3600 });
+
+    // 시나리오 완료 확인
+    if (session.turnIndex >= scenario.turns.length) {
+      feedbackText += '\n\n━━━━━━━━━━━━━━━━━━\n✅ 시나리오 완료!\n\n모든 턴을 완료했습니다.\n수고하셨습니다! 🎉';
+
+      return NextResponse.json({
+        version: '2.0',
+        template: {
+          outputs: [{ simpleText: { text: feedbackText } }],
+          quickReplies: [
+            {
+              label: '🔄 처음으로',
+              action: 'message',
+              messageText: '시작',
+            },
+          ],
+        },
+      });
+    }
+
+    // 다음 턴 표시
+    const nextTurn = scenario.turns[session.turnIndex];
+    feedbackText += `\n\n━━━━━━━━━━━━━━━━━━\n📌 다음 상황\n━━━━━━━━━━━━━━━━━━\n\n👨 환자: "${nextTurn.text}"\n\n💭 감정: ${nextTurn.emotion}\n\n━━━━━━━━━━━━━━━━━━\n\n👨‍⚕️ 어떻게 응대하시겠습니까?\n\n💬 답변을 입력해주세요!`;
 
     return NextResponse.json({
       version: '2.0',
       template: {
-        outputs: [
-          {
-            simpleText: {
-              text: feedbackText,
-            },
-          },
-        ],
-        quickReplies: [
-          {
-            label: '🔄 처음으로',
-            action: 'message',
-            messageText: '시작',
-          },
-        ],
+        outputs: [{ simpleText: { text: feedbackText } }],
       },
     });
 
