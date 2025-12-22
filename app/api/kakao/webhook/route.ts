@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import Anthropic from '@anthropic-ai/sdk';
 import { scenarios } from '../../../../core/scenarios';
-import { kv } from '@vercel/kv';
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY || '',
@@ -42,30 +41,13 @@ type KakaoRequest = {
   };
 };
 
-type Session = {
-  scenarioId: string | null;
-  turnIndex: number;
-};
-
 export async function POST(req: NextRequest) {
   try {
     const body: KakaoRequest = await req.json();
-    const userId = body.userRequest.user.id;
     const userInput = body.userRequest.utterance.trim();
-
-    // 세션 가져오기
-    const sessionKey = `session:${userId}`;
-    let session: Session = await kv.get(sessionKey) || {
-      scenarioId: null,
-      turnIndex: 0,
-    };
 
     // 1. 시작 명령어
     if (userInput === '시작') {
-      // 세션 초기화
-      session = { scenarioId: null, turnIndex: 0 };
-      await kv.set(sessionKey, session, { ex: 3600 }); // 1시간 유효
-
       return NextResponse.json({
         version: '2.0',
         template: {
@@ -80,28 +62,31 @@ export async function POST(req: NextRequest) {
             {
               label: '😰 불안한 첫 내원',
               action: 'message',
-              messageText: 'S1',
+              messageText: 'SCENARIO:S1',
             },
             {
               label: '🤔 임플란트 망설임',
               action: 'message',
-              messageText: 'S2',
+              messageText: 'SCENARIO:S2',
             },
           ],
         },
       });
     }
 
-    // 2. 시나리오 선택
-    if (userInput === 'S1' || userInput === 'S2') {
-      const scenario = scenarios[userInput];
+    // 2. 시나리오 시작
+    if (userInput.startsWith('SCENARIO:')) {
+      const scenarioId = userInput.replace('SCENARIO:', '');
+      const scenario = scenarios[scenarioId];
       
-      // 세션 업데이트
-      session = {
-        scenarioId: userInput,
-        turnIndex: 0,
-      };
-      await kv.set(sessionKey, session, { ex: 3600 });
+      if (!scenario) {
+        return NextResponse.json({
+          version: '2.0',
+          template: {
+            outputs: [{ simpleText: { text: '시나리오를 찾을 수 없습니다.' } }],
+          },
+        });
+      }
 
       const firstTurn = scenario.turns[0];
 
@@ -115,128 +100,168 @@ export async function POST(req: NextRequest) {
               },
             },
           ],
+          quickReplies: [
+            {
+              label: '📝 답변 예시',
+              action: 'message',
+              messageText: `ANSWER:${scenarioId}:0:안녕하세요`,
+            },
+          ],
         },
       });
     }
 
-    // 3. 사용자 답변 분석
-    if (!session.scenarioId) {
+    // 3. 턴 표시
+    if (userInput.startsWith('TURN:')) {
+      const parts = userInput.split(':');
+      const scenarioId = parts[1];
+      const turnIndex = parseInt(parts[2]);
+      
+      const scenario = scenarios[scenarioId];
+      const turn = scenario.turns[turnIndex];
+
       return NextResponse.json({
         version: '2.0',
         template: {
           outputs: [
             {
               simpleText: {
-                text: '시나리오를 먼저 선택해주세요.\n\n"시작"을 입력하세요!',
+                text: `━━━━━━━━━━━━━━━━━━\n📌 ${scenario.title} - 턴 ${turnIndex + 1}\n━━━━━━━━━━━━━━━━━━\n\n👨 환자: "${turn.text}"\n\n💭 감정: ${turn.emotion}\n\n━━━━━━━━━━━━━━━━━━\n\n👨‍⚕️ 어떻게 응대하시겠습니까?\n\n💬 답변을 입력해주세요!`,
               },
             },
           ],
           quickReplies: [
             {
-              label: '🔄 시작하기',
+              label: '📝 답변 예시',
               action: 'message',
-              messageText: '시작',
+              messageText: `ANSWER:${scenarioId}:${turnIndex}:안녕하세요`,
             },
           ],
         },
       });
     }
 
-    const scenario = scenarios[session.scenarioId];
-    const currentTurn = scenario.turns[session.turnIndex];
+    // 4. 답변 분석
+    if (userInput.startsWith('ANSWER:')) {
+      const parts = userInput.split(':');
+      const scenarioId = parts[1];
+      const turnIndex = parseInt(parts[2]);
+      const counselorAnswer = parts.slice(3).join(':');
 
-    // Claude 분석
-    const analysisPrompt = `
+      const scenario = scenarios[scenarioId];
+      const turn = scenario.turns[turnIndex];
+
+      // Claude 분석
+      const analysisPrompt = `
 상황: ${scenario.context}
-환자 말: "${currentTurn.text}"
-환자 감정: ${currentTurn.emotion}
-상담사 답변: "${userInput}"
+환자 말: "${turn.text}"
+환자 감정: ${turn.emotion}
+상담사 답변: "${counselorAnswer}"
 
 위 상담사 답변을 분석하고 JSON 형식으로 피드백하세요.
 `;
 
-    const message = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1000,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: analysisPrompt }],
-    });
+      const message = await anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1000,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: analysisPrompt }],
+      });
 
-    const responseText = message.content[0].type === 'text' ? message.content[0].text : '';
-    
-    let analysis;
-    try {
-      const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-      analysis = jsonMatch ? JSON.parse(jsonMatch[0]) : {
-        score: 50,
-        grade: 'C',
-        feedback: {
-          good: ['답변을 제출했습니다.'],
-          missing: ['구체적인 피드백을 생성하지 못했습니다.']
-        },
-        next_tip: '다시 시도해보세요.'
-      };
-    } catch (e) {
-      analysis = {
-        score: 50,
-        grade: 'C',
-        feedback: {
-          good: ['답변을 제출했습니다.'],
-          missing: ['분석 중 오류가 발생했습니다.']
-        },
-        next_tip: '다시 시도해보세요.'
-      };
-    }
+      const responseText = message.content[0].type === 'text' ? message.content[0].text : '';
+      
+      let analysis;
+      try {
+        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+        analysis = jsonMatch ? JSON.parse(jsonMatch[0]) : {
+          score: 50,
+          grade: 'C',
+          feedback: { good: ['답변을 제출했습니다.'], missing: ['분석 실패'] },
+          next_tip: '다시 시도해보세요.'
+        };
+      } catch (e) {
+        analysis = {
+          score: 50,
+          grade: 'C',
+          feedback: { good: ['답변을 제출했습니다.'], missing: ['분석 중 오류'] },
+          next_tip: '다시 시도해보세요.'
+        };
+      }
 
-    let feedbackText = `━━━━━━━━━━━━━━━━━━\n📊 분석 결과\n━━━━━━━━━━━━━━━━━━\n\n점수: ${analysis.score}점 (${analysis.grade} 등급)\n\n`;
-    
-    if (analysis.feedback.good && analysis.feedback.good.length > 0) {
-      feedbackText += '✅ 잘한 점:\n' + analysis.feedback.good.map((g: string) => `• ${g}`).join('\n') + '\n\n';
-    }
-    
-    if (analysis.feedback.warning) {
-      feedbackText += `⚠️ 주의:\n• ${analysis.feedback.warning}\n\n`;
-    }
-    
-    if (analysis.feedback.missing && analysis.feedback.missing.length > 0) {
-      feedbackText += '💡 개선할 점:\n' + analysis.feedback.missing.map((m: string) => `• ${m}`).join('\n') + '\n\n';
-    }
-    
-    if (analysis.next_tip) {
-      feedbackText += `🎯 다음 팁:\n${analysis.next_tip}\n`;
-    }
+      let feedbackText = `━━━━━━━━━━━━━━━━━━\n📊 분석 결과\n━━━━━━━━━━━━━━━━━━\n\n점수: ${analysis.score}점 (${analysis.grade} 등급)\n\n`;
+      
+      if (analysis.feedback.good?.length > 0) {
+        feedbackText += '✅ 잘한 점:\n' + analysis.feedback.good.map((g: string) => `• ${g}`).join('\n') + '\n\n';
+      }
+      
+      if (analysis.feedback.warning) {
+        feedbackText += `⚠️ 주의:\n• ${analysis.feedback.warning}\n\n`;
+      }
+      
+      if (analysis.feedback.missing?.length > 0) {
+        feedbackText += '💡 개선할 점:\n' + analysis.feedback.missing.map((m: string) => `• ${m}`).join('\n') + '\n\n';
+      }
+      
+      if (analysis.next_tip) {
+        feedbackText += `🎯 다음 팁:\n${analysis.next_tip}`;
+      }
 
-    // 다음 턴으로 이동
-    session.turnIndex++;
-    await kv.set(sessionKey, session, { ex: 3600 });
+      const nextTurnIndex = turnIndex + 1;
+      const hasMoreTurns = nextTurnIndex < scenario.turns.length;
 
-    // 시나리오 완료 확인
-    if (session.turnIndex >= scenario.turns.length) {
-      feedbackText += '\n\n━━━━━━━━━━━━━━━━━━\n✅ 시나리오 완료!\n\n모든 턴을 완료했습니다.\n수고하셨습니다! 🎉';
-
-      return NextResponse.json({
-        version: '2.0',
-        template: {
-          outputs: [{ simpleText: { text: feedbackText } }],
-          quickReplies: [
+      const quickReplies = hasMoreTurns
+        ? [
+            {
+              label: '➡️ 다음 턴',
+              action: 'message',
+              messageText: `TURN:${scenarioId}:${nextTurnIndex}`,
+            },
             {
               label: '🔄 처음으로',
               action: 'message',
               messageText: '시작',
             },
-          ],
+          ]
+        : [
+            {
+              label: '🎉 완료! 처음으로',
+              action: 'message',
+              messageText: '시작',
+            },
+          ];
+
+      if (!hasMoreTurns) {
+        feedbackText += '\n\n━━━━━━━━━━━━━━━━━━\n✅ 시나리오 완료!\n\n모든 턴을 완료했습니다.\n수고하셨습니다! 🎉';
+      }
+
+      return NextResponse.json({
+        version: '2.0',
+        template: {
+          outputs: [{ simpleText: { text: feedbackText } }],
+          quickReplies,
         },
       });
     }
 
-    // 다음 턴 표시
-    const nextTurn = scenario.turns[session.turnIndex];
-    feedbackText += `\n\n━━━━━━━━━━━━━━━━━━\n📌 다음 상황\n━━━━━━━━━━━━━━━━━━\n\n👨 환자: "${nextTurn.text}"\n\n💭 감정: ${nextTurn.emotion}\n\n━━━━━━━━━━━━━━━━━━\n\n👨‍⚕️ 어떻게 응대하시겠습니까?\n\n💬 답변을 입력해주세요!`;
-
+    // 5. 일반 텍스트 입력 = 현재 진행 중인 답변으로 간주
+    // 마지막으로 본 시나리오가 없으므로 시작으로 유도
     return NextResponse.json({
       version: '2.0',
       template: {
-        outputs: [{ simpleText: { text: feedbackText } }],
+        outputs: [
+          {
+            simpleText: {
+              text: '시나리오를 먼저 선택해주세요!\n\n"시작"을 입력하세요.',
+            },
+          },
+        ],
+        quickReplies: [
+          {
+            label: '🔄 시작하기',
+            action: 'message',
+            messageText: '시작',
+          },
+        ],
       },
     });
 
